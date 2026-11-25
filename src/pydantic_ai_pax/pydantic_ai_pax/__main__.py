@@ -7,7 +7,7 @@ import sqlite3
 import sys
 import warnings
 from collections.abc import Callable, Generator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import cast
 
@@ -43,15 +43,16 @@ def _finish_reset_proactor_transport(transport: object) -> None:
     sock: object = getattr(transport, '_sock', None)
     close = getattr(sock, 'close', None)
     if callable(close):
-        try:
+        with suppress(OSError):
             close()
-        except OSError:
-            pass
     setattr(transport, '_sock', None)
     server: object = getattr(transport, '_server', None)
     detach = getattr(server, '_detach', None)
     if callable(detach):
-        detach(transport)
+        try:
+            detach(transport)
+        except TypeError:
+            detach()
         setattr(transport, '_server', None)
     setattr(transport, '_called_connection_lost', True)
 
@@ -89,6 +90,8 @@ def quiet_windows_proactor_reset() -> Generator[None]:
                 and getattr(self, '_sock', None) is not None
             ):
                 _finish_reset_proactor_transport(self)
+                if err.__context__ is not None:
+                    raise err.__context__ from None
                 return
             raise
 
