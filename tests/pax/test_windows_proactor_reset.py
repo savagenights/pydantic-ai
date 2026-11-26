@@ -23,9 +23,6 @@ class _DummySock:
         self.close_error = close_error
         self.closed = False
 
-    def fileno(self) -> int:
-        return 123
-
     def shutdown(self, _how: int) -> None:
         if self.shutdown_error is not None:
             raise self.shutdown_error
@@ -61,7 +58,7 @@ class _FakeTransport:
         *,
         sock: _DummySock | None,
         protocol: _DummyProtocol,
-        server: _DummyServer | None = None,
+        server: object = None,
         called_connection_lost: bool = False,
     ) -> None:
         self._called_connection_lost = called_connection_lost
@@ -74,7 +71,7 @@ class _FakeTransport:
         return self._sock
 
     @property
-    def server(self) -> _DummyServer | None:
+    def server(self) -> object:
         return self._server
 
     @property
@@ -87,10 +84,9 @@ class _FakeTransport:
         try:
             self._protocol.connection_lost(exc)
         finally:
-            if self._sock is not None and self._sock.fileno() != -1:
-                self._sock.shutdown(2)
-            if self._sock is not None:
-                self._sock.close()
+            assert self._sock is not None
+            self._sock.shutdown(2)
+            self._sock.close()
             self._sock = None
             if self._server is not None:
                 detach = cast(Callable[[object], None], getattr(self._server, '_detach'))
@@ -101,7 +97,7 @@ class _FakeTransport:
 
 def _win_reset_error(winerror: int = 10054) -> ConnectionResetError:
     err = ConnectionResetError(winerror, f'simulated winerror {winerror}')
-    err.winerror = winerror
+    setattr(err, 'winerror', winerror)
     return err
 
 
@@ -120,7 +116,7 @@ def _invoke_call_connection_lost(
 def _patch_proactor(
     monkeypatch: pytest.MonkeyPatch,
     platform: str = 'win32',
-    transport_cls: type[object] = _FakeTransport,
+    transport_cls: object = _FakeTransport,
 ) -> None:
     monkeypatch.setattr(sys, 'platform', platform)
     monkeypatch.setattr(
@@ -129,6 +125,26 @@ def _patch_proactor(
         transport_cls,
         raising=False,
     )
+
+
+def test_normal_teardown_passes_through_untouched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_proactor(monkeypatch)
+    sock = _DummySock()
+    protocol = _DummyProtocol()
+    server = _DummyServer()
+    transport = _FakeTransport(sock=sock, protocol=protocol, server=server)
+
+    with quiet_windows_proactor_reset():
+        _invoke_call_connection_lost(transport)
+
+    assert protocol.calls == [None]
+    assert sock.closed is True
+    assert transport.sock is None
+    assert server.detached == [transport]
+    assert transport.server is None
+    assert transport.called_connection_lost is True
 
 
 def test_suppresses_winerror_10054_on_shutdown_and_finishes_cleanup(
@@ -174,6 +190,24 @@ def test_preserves_protocol_error_when_shutdown_also_resets(
     assert transport.called_connection_lost is True
 
 
+def test_does_not_reraise_outer_exception_context_when_protocol_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_proactor(monkeypatch)
+    sock = _DummySock(shutdown_error=_win_reset_error())
+    transport = _FakeTransport(sock=sock, protocol=_DummyProtocol())
+
+    with quiet_windows_proactor_reset():
+        try:
+            raise ValueError('outer active exception')
+        except ValueError:
+            _invoke_call_connection_lost(transport)
+
+    assert sock.closed is True
+    assert transport.sock is None
+    assert transport.called_connection_lost is True
+
+
 def test_cleanup_continues_when_socket_close_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -205,7 +239,7 @@ def test_reraises_non_10054_connection_reset_error(
     with quiet_windows_proactor_reset(), pytest.raises(ConnectionResetError) as exc_info:
         _invoke_call_connection_lost(transport)
 
-    assert exc_info.value.winerror == 10053
+    assert getattr(exc_info.value, 'winerror', None) == 10053
 
 
 def test_reraises_winerror_10054_from_protocol_connection_lost(
@@ -221,14 +255,14 @@ def test_reraises_winerror_10054_from_protocol_connection_lost(
     with quiet_windows_proactor_reset(), pytest.raises(ConnectionResetError) as exc_info:
         _invoke_call_connection_lost(transport)
 
-    assert exc_info.value.winerror == 10054
+    assert getattr(exc_info.value, 'winerror', None) == 10054
     assert sock.closed is True
     assert transport.called_connection_lost is True
 
 
 def _plain_os_error_10054() -> OSError:
     err = OSError('plain oserror')
-    err.winerror = 10054
+    setattr(err, 'winerror', 10054)
     return err
 
 
@@ -293,7 +327,7 @@ def test_restores_original_method_on_normal_and_exceptional_exit(
     assert cast(object, getattr(_FreshTransport, '_call_connection_lost')) is original
 
 
-def test_noop_on_non_windows(
+def test_noop_on_non_windows_and_missing_transport(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_proactor(monkeypatch, 'linux')
@@ -301,6 +335,10 @@ def test_noop_on_non_windows(
 
     with quiet_windows_proactor_reset():
         assert cast(object, getattr(_FakeTransport, '_call_connection_lost')) is original
+
+    _patch_proactor(monkeypatch, 'win32', transport_cls=None)
+    with quiet_windows_proactor_reset():
+        assert getattr(proactor_events, '_ProactorBasePipeTransport') is None
 
 
 def test_handles_python_311_zero_arg_server_detach(
@@ -313,35 +351,13 @@ def test_handles_python_311_zero_arg_server_detach(
         def _detach(self) -> None:
             self.detached_calls += 1
 
-    class _ZeroArgFakeTransport(_FakeTransport):
-        def _call_connection_lost(self, exc: BaseException | None) -> None:
-            if self._called_connection_lost:
-                return
-            try:
-                self._protocol.connection_lost(exc)
-            finally:
-                if self._sock is not None and self._sock.fileno() != -1:
-                    self._sock.shutdown(2)
-                if self._sock is not None:
-                    self._sock.close()
-                self._sock = None
-                if self._server is not None:
-                    detach = cast(Callable[[], None], getattr(self._server, '_detach'))
-                    detach()
-                    self._server = None
-                self._called_connection_lost = True
-
-    _patch_proactor(monkeypatch, transport_cls=_ZeroArgFakeTransport)
+    _patch_proactor(monkeypatch)
     sock = _DummySock(shutdown_error=_win_reset_error())
     server = _ZeroArgServer()
-    transport = _ZeroArgFakeTransport(
-        sock=sock,
-        protocol=_DummyProtocol(),
-        server=cast(_DummyServer, server),
-    )
+    transport = _FakeTransport(sock=sock, protocol=_DummyProtocol(), server=server)
 
     with quiet_windows_proactor_reset():
-        _invoke_call_connection_lost(transport, transport_cls=_ZeroArgFakeTransport)
+        _invoke_call_connection_lost(transport)
 
     assert sock.closed is True
     assert transport.sock is None

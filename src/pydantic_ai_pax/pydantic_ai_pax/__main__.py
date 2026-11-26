@@ -38,6 +38,14 @@ def quiet_telemetry_logs() -> Generator[None]:
 _PROACTOR_RESET_WINERROR = 10054
 
 
+def _is_suppressed_proactor_reset(transport: object, err: ConnectionResetError) -> bool:
+    return (
+        getattr(err, 'winerror', None) == _PROACTOR_RESET_WINERROR
+        and not getattr(transport, '_called_connection_lost', True)
+        and getattr(transport, '_sock', None) is not None
+    )
+
+
 def _finish_reset_proactor_transport(transport: object) -> None:
     """Complete the socket close and server detach skipped when ``shutdown()`` raises WinError 10054."""
     sock: object = getattr(transport, '_sock', None)
@@ -55,6 +63,26 @@ def _finish_reset_proactor_transport(transport: object) -> None:
             detach()
         setattr(transport, '_server', None)
     setattr(transport, '_called_connection_lost', True)
+
+
+def _make_proactor_reset_wrapper(
+    original: Callable[[object, BaseException | None], None],
+) -> Callable[[object, BaseException | None], None]:
+    def wrapped(self: object, exc: BaseException | None) -> None:
+        prior_exc = sys.exc_info()[1]
+        protocol_exc: BaseException | None = None
+        try:
+            original(self, exc)
+        except ConnectionResetError as err:
+            if not _is_suppressed_proactor_reset(self, err):
+                raise
+            _finish_reset_proactor_transport(self)
+            if err.__context__ is not None and err.__context__ is not prior_exc:
+                protocol_exc = err.__context__
+        if protocol_exc is not None:
+            raise protocol_exc
+
+    return wrapped
 
 
 @contextmanager
@@ -80,22 +108,7 @@ def quiet_windows_proactor_reset() -> Generator[None]:
         yield
         return
 
-    def wrapped(self: object, exc: BaseException | None) -> None:
-        try:
-            original(self, exc)
-        except ConnectionResetError as err:
-            if (
-                getattr(err, 'winerror', None) == _PROACTOR_RESET_WINERROR
-                and not getattr(self, '_called_connection_lost', True)
-                and getattr(self, '_sock', None) is not None
-            ):
-                _finish_reset_proactor_transport(self)
-                if err.__context__ is not None:
-                    raise err.__context__ from None
-                return
-            raise
-
-    setattr(transport_cls, '_call_connection_lost', wrapped)
+    setattr(transport_cls, '_call_connection_lost', _make_proactor_reset_wrapper(original))
     try:
         yield
     finally:
